@@ -25,6 +25,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/holiman/uint256"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
@@ -36,7 +38,6 @@ import (
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/trie/triestate"
-	"github.com/holiman/uint256"
 )
 
 type revision struct {
@@ -77,10 +78,11 @@ type StateDB struct {
 
 	// This map holds 'live' objects, which will get modified while processing
 	// a state transition.
-	stateObjects         map[common.Address]*stateObject
-	stateObjectsPending  map[common.Address]struct{}            // State objects finalized but not yet written to the trie
-	stateObjectsDirty    map[common.Address]struct{}            // State objects modified in the current execution
-	stateObjectsDestruct map[common.Address]*types.StateAccount // State objects destructed in the block along with its previous value
+	stateObjects              map[common.Address]*stateObject
+	stateObjectsPending       map[common.Address]struct{}            // State objects finalized but not yet written to the trie
+	stateObjectsDirty         map[common.Address]struct{}            // State objects modified in the current execution
+	stateObjectsDestruct      map[common.Address]*types.StateAccount // State objects destructed in the block along with its previous value
+	stateObjectsPendingCommit map[common.Address]struct{}
 
 	// DB error.
 	// State objects are used by the consensus core and VM which are
@@ -145,24 +147,25 @@ func New(root common.Hash, db Database, snaps *snapshot.Tree) (*StateDB, error) 
 		return nil, err
 	}
 	sdb := &StateDB{
-		db:                   db,
-		trie:                 tr,
-		originalRoot:         root,
-		snaps:                snaps,
-		accounts:             make(map[common.Hash][]byte),
-		storages:             make(map[common.Hash]map[common.Hash][]byte),
-		accountsOrigin:       make(map[common.Address][]byte),
-		storagesOrigin:       make(map[common.Address]map[common.Hash][]byte),
-		stateObjects:         make(map[common.Address]*stateObject),
-		stateObjectsPending:  make(map[common.Address]struct{}),
-		stateObjectsDirty:    make(map[common.Address]struct{}),
-		stateObjectsDestruct: make(map[common.Address]*types.StateAccount),
-		logs:                 make(map[common.Hash][]*types.Log),
-		preimages:            make(map[common.Hash][]byte),
-		journal:              newJournal(),
-		accessList:           newAccessList(),
-		transientStorage:     newTransientStorage(),
-		hasher:               crypto.NewKeccakState(),
+		db:                        db,
+		trie:                      tr,
+		originalRoot:              root,
+		snaps:                     snaps,
+		accounts:                  make(map[common.Hash][]byte),
+		storages:                  make(map[common.Hash]map[common.Hash][]byte),
+		accountsOrigin:            make(map[common.Address][]byte),
+		storagesOrigin:            make(map[common.Address]map[common.Hash][]byte),
+		stateObjects:              make(map[common.Address]*stateObject),
+		stateObjectsPending:       make(map[common.Address]struct{}),
+		stateObjectsDirty:         make(map[common.Address]struct{}),
+		stateObjectsDestruct:      make(map[common.Address]*types.StateAccount),
+		stateObjectsPendingCommit: make(map[common.Address]struct{}),
+		logs:                      make(map[common.Hash][]*types.Log),
+		preimages:                 make(map[common.Hash][]byte),
+		journal:                   newJournal(),
+		accessList:                newAccessList(),
+		transientStorage:          newTransientStorage(),
+		hasher:                    crypto.NewKeccakState(),
 	}
 	if sdb.snaps != nil {
 		sdb.snap = sdb.snaps.Snapshot(root)
@@ -850,6 +853,7 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 		obj.created = false
 		s.stateObjectsPending[addr] = struct{}{}
 		s.stateObjectsDirty[addr] = struct{}{}
+		delete(s.stateObjectsPendingCommit, addr)
 
 		// At this point, also ship the address off to the precacher. The precacher
 		// will start loading tries, and when the change is eventually committed,
@@ -861,6 +865,33 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 	}
 	// Invalidate journal because reverting across transactions is not allowed.
 	s.clearJournalAndRefund()
+}
+
+func (s *StateDB) PendingIntermediateRoot(deleteEmptyObjects bool) {
+	s.Finalise(deleteEmptyObjects)
+	for addr := range s.stateObjectsPending {
+		if obj := s.stateObjects[addr]; !obj.deleted {
+			obj.updateRoot()
+		}
+	}
+	usedAddrs := make([][]byte, 0, len(s.stateObjectsPending))
+	var deletedAddrs []common.Address
+	for addr := range s.stateObjectsPending {
+		if obj := s.stateObjects[addr]; !obj.deleted {
+			s.updateStateObject(obj)
+			s.AccountUpdated += 1
+		} else {
+			deletedAddrs = append(deletedAddrs, obj.address)
+		}
+		usedAddrs = append(usedAddrs, common.CopyBytes(addr[:])) // Copy needed for closure
+	}
+	for _, deletedAddr := range deletedAddrs {
+		s.deleteStateObject(deletedAddr)
+		s.AccountDeleted += 1
+	}
+	if len(s.stateObjectsPending) > 0 {
+		s.stateObjectsPending = make(map[common.Address]struct{})
+	}
 }
 
 // IntermediateRoot computes the current root hash of the state trie.
@@ -1146,6 +1177,63 @@ func (s *StateDB) GetTrie() Trie {
 	return s.trie
 }
 
+func (s *StateDB) PendingCommit(deleteEmptyObjects bool) error {
+	if s.dbErr != nil {
+		return fmt.Errorf("pending commit aborted due to earlier error: %v", s.dbErr)
+	}
+	s.PendingIntermediateRoot(deleteEmptyObjects)
+	var (
+		storageTrieNodesUpdated int
+		storageTrieNodesDeleted int
+		nodes                   = trienode.NewMergedNodeSet()
+		//codeWriter              = s.db.DiskDB().NewBatch()
+	)
+	// Handle all state deletions first
+	if err := s.handleDestruction(nodes); err != nil {
+		return err
+	}
+	// Handle all state updates afterwards
+	for addr := range s.stateObjectsDirty {
+		obj := s.stateObjects[addr]
+		if obj.deleted {
+			continue
+		}
+		if _, ok := s.stateObjectsPendingCommit[addr]; ok {
+			continue
+		}
+		// Write any contract code associated with the state object
+		//if obj.code != nil && obj.dirtyCode {
+		//	rawdb.WriteCode(codeWriter, common.BytesToHash(obj.CodeHash()), obj.code)
+		//	obj.dirtyCode = false
+		//}
+		// Write any storage changes in the state object to its storage trie
+		set, err := obj.pendingCommit()
+		if err != nil {
+			return err
+		}
+		// Merge the dirty nodes of storage trie into global set. It is possible
+		// that the account was destructed and then resurrected in the same block.
+		// In this case, the node set is shared by both accounts.
+		if set != nil {
+			if err := nodes.Merge(set); err != nil {
+				return err
+			}
+			updates, deleted := set.Size()
+			storageTrieNodesUpdated += updates
+			storageTrieNodesDeleted += deleted
+		}
+		s.stateObjectsPendingCommit[addr] = struct{}{}
+	}
+	origin := s.originalRoot
+	if origin == (common.Hash{}) {
+		origin = types.EmptyRootHash
+	}
+	if err := s.db.TrieDB().PendingUpdate(origin, nodes); err != nil {
+		return err
+	}
+	return nil
+}
+
 // Commit writes the state to the underlying in-memory trie database.
 // Once the state is committed, tries cached in stateDB (including account
 // trie, storage tries) will no longer be functional. A new state instance
@@ -1282,6 +1370,7 @@ func (s *StateDB) Commit(block uint64, deleteEmptyObjects bool) (common.Hash, er
 	s.storagesOrigin = make(map[common.Address]map[common.Hash][]byte)
 	s.stateObjectsDirty = make(map[common.Address]struct{})
 	s.stateObjectsDestruct = make(map[common.Address]*types.StateAccount)
+	s.stateObjectsPendingCommit = make(map[common.Address]struct{})
 	return root, nil
 }
 

@@ -17,6 +17,7 @@
 package hashdb
 
 import (
+	sysbytes "bytes"
 	"errors"
 	"fmt"
 	"reflect"
@@ -24,6 +25,7 @@ import (
 	"time"
 
 	"github.com/VictoriaMetrics/fastcache"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -102,6 +104,8 @@ type Database struct {
 	dirtiesSize  common.StorageSize // Storage size of the dirty node cache (exc. metadata)
 	childrenSize common.StorageSize // Storage size of the external children tracking
 
+	pendingWrite map[common.Hash][]byte
+
 	lock sync.RWMutex
 }
 
@@ -140,11 +144,32 @@ func New(diskdb ethdb.Database, config *Config, resolver ChildResolver) *Databas
 		cleans = fastcache.New(config.CleanCacheSize)
 	}
 	return &Database{
-		diskdb:   diskdb,
-		resolver: resolver,
-		cleans:   cleans,
-		dirties:  make(map[common.Hash]*cachedNode),
+		diskdb:       diskdb,
+		resolver:     resolver,
+		cleans:       cleans,
+		dirties:      make(map[common.Hash]*cachedNode),
+		pendingWrite: map[common.Hash][]byte{},
 	}
+}
+
+func (db *Database) pendingBatchInsert(batch ethdb.Batch, hash common.Hash, node []byte, uncacher *cleaner) error {
+	prev, ok := db.pendingWrite[hash]
+	if ok && sysbytes.Equal(prev, node) {
+		return nil
+	}
+	rawdb.WriteLegacyTrieNode(batch, hash, node)
+	db.pendingWrite[hash] = node
+	if batch.ValueSize() >= ethdb.IdealBatchSize {
+		if err := batch.Write(); err != nil {
+			return err
+		}
+		err := batch.Replay(uncacher)
+		if err != nil {
+			return err
+		}
+		batch.Reset()
+	}
+	return nil
 }
 
 // insert inserts a trie node into the memory database. All nodes inserted by
@@ -596,6 +621,59 @@ func (db *Database) Update(root common.Hash, parent common.Hash, block uint64, n
 			}
 		}
 	}
+	return nil
+}
+
+// Update inserts the dirty nodes in provided nodeset into database and link the
+// account trie with multiple storage tries if necessary.
+func (db *Database) PendingUpdate(parent common.Hash, nodes *trienode.MergedNodeSet) error {
+	// Ensure the parent state is present and signal a warning if not.
+	if parent != types.EmptyRootHash {
+		if blob, _ := db.node(parent); len(blob) == 0 {
+			log.Error("parent state is not present")
+		}
+	}
+	db.lock.Lock()
+	defer db.lock.Unlock()
+
+	// Insert dirty nodes into the database. In the same tree, it must be
+	// ensured that children are inserted first, then parent so that children
+	// can be linked with their parent correctly.
+	//
+	// Note, the storage tries must be flushed before the account trie to
+	// retain the invariant that children go into the dirty cache first.
+	var order []common.Hash
+	for owner := range nodes.Sets {
+		if owner == (common.Hash{}) {
+			continue
+		}
+		order = append(order, owner)
+	}
+	if _, ok := nodes.Sets[common.Hash{}]; ok {
+		order = append(order, common.Hash{})
+	}
+	batch := db.diskdb.NewBatch()
+	uncacher := &cleaner{db}
+	for _, owner := range order {
+		subset := nodes.Sets[owner]
+		subset.ForEachWithOrder(func(path string, n *trienode.Node) {
+			if n.IsDeleted() {
+				return // ignore deletion
+			}
+			db.pendingBatchInsert(batch, n.Hash, n.Blob, uncacher)
+		})
+	}
+	// Trie mostly committed to disk, flush any batch leftovers
+	if err := batch.Write(); err != nil {
+		log.Error("Failed to write trie to disk", "err", err)
+		return err
+	}
+	// Uncache any leftovers in the last batch
+	if err := batch.Replay(uncacher); err != nil {
+		return err
+	}
+	batch.Reset()
+	db.pendingWrite = make(map[common.Hash][]byte)
 	return nil
 }
 

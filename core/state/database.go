@@ -21,6 +21,7 @@ import (
 	"fmt"
 
 	"github.com/crate-crypto/go-ipa/banderwagon"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/core/rawdb"
@@ -125,6 +126,8 @@ type Trie interface {
 	// Once the trie is committed, it's not usable anymore. A new trie must
 	// be created with new root and updated trie database for following usage
 	Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet, error)
+
+	PendingCommit(collectLeaf bool) (common.Hash, *trienode.NodeSet, error)
 
 	// NodeIterator returns an iterator that returns nodes of the trie. Iteration
 	// starts at the key after the given start key. And error will be returned
