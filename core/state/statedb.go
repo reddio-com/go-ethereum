@@ -1488,7 +1488,7 @@ func (s *StateDB) AddrInPendingCommitSub(addr common.Address) {
 	}
 }
 
-func (s *StateDB) ClearAddrInPendingCommit(addr common.Address) {
+func (s *StateDB) ClearAddrInPendingCommit() {
 	s.stateObjectCounterInCommit = make(map[common.Address]int)
 }
 
