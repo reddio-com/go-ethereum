@@ -25,6 +25,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/holiman/uint256"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
@@ -36,7 +38,6 @@ import (
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/trie/triestate"
-	"github.com/holiman/uint256"
 )
 
 type revision struct {
@@ -686,6 +687,30 @@ func (s *StateDB) CreateAccount(addr common.Address) {
 	if prev != nil {
 		newObj.setBalance(prev.data.Balance)
 	}
+}
+
+func (s *StateDB) SimpleCopy(needCopy map[common.Address]struct{}) *StateDB {
+	state := &StateDB{
+		db:           s.db,
+		trie:         s.db.CopyTrie(s.trie),
+		originalRoot: s.originalRoot,
+		accounts:     copySet(s.accounts),
+		storages:     copy2DSet(s.storages),
+		stateObjects: make(map[common.Address]*stateObject, len(s.journal.dirties)),
+		refund:       s.refund,
+		logs:         make(map[common.Hash][]*types.Log, len(s.logs)),
+		logSize:      s.logSize,
+		journal:      newJournal(),
+		hasher:       crypto.NewKeccakState(),
+	}
+	for addr := range needCopy {
+		obj := s.stateObjects[addr]
+		if obj != nil {
+			state.stateObjects[addr] = obj.simpleCopy(state)
+		}
+	}
+
+	return state
 }
 
 // Copy creates a deep, independent copy of the state.
