@@ -23,13 +23,14 @@ import (
 	"maps"
 	"time"
 
+	"github.com/holiman/uint256"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie/trienode"
-	"github.com/holiman/uint256"
 )
 
 type Code []byte
@@ -462,6 +463,27 @@ func (s *stateObject) deepCopy(db *StateDB) *stateObject {
 	if s.trie != nil {
 		obj.trie = db.db.CopyTrie(s.trie)
 	}
+	obj.code = s.code
+	obj.dirtyStorage = s.dirtyStorage.Copy()
+	obj.originStorage = s.originStorage.Copy()
+	obj.pendingStorage = s.pendingStorage.Copy()
+	obj.selfDestructed = s.selfDestructed
+	obj.dirtyCode = s.dirtyCode
+	obj.deleted = s.deleted
+	return obj
+}
+
+func (s *stateObject) simpleCopy(db *StateDB) *stateObject {
+	obj := &stateObject{
+		db:       db,
+		address:  s.address,
+		addrHash: s.addrHash,
+		origin:   s.origin,
+		data:     s.data,
+	}
+	//if s.trie != nil {
+	//	obj.trie = db.db.CopyTrie(s.trie)
+	//}
 	obj.code = s.code
 	obj.dirtyStorage = s.dirtyStorage.Copy()
 	obj.originStorage = s.originStorage.Copy()

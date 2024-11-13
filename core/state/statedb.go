@@ -25,6 +25,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/holiman/uint256"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
@@ -36,7 +38,6 @@ import (
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/trie/triestate"
-	"github.com/holiman/uint256"
 )
 
 type revision struct {
@@ -686,6 +687,60 @@ func (s *StateDB) CreateAccount(addr common.Address) {
 	if prev != nil {
 		newObj.setBalance(prev.data.Balance)
 	}
+}
+
+func (s *StateDB) SimpleCopy(needCopy map[common.Address]struct{}) *StateDB {
+	// Copy all the basic fields, initialize the memory ones
+	state := &StateDB{
+		db:                   s.db,
+		trie:                 s.db.CopyTrie(s.trie),
+		originalRoot:         s.originalRoot,
+		accounts:             copySet(s.accounts),
+		storages:             copy2DSet(s.storages),
+		accountsOrigin:       copySet(s.accountsOrigin),
+		storagesOrigin:       copy2DSet(s.storagesOrigin),
+		stateObjects:         make(map[common.Address]*stateObject, len(s.journal.dirties)),
+		stateObjectsPending:  make(map[common.Address]struct{}, len(s.stateObjectsPending)),
+		stateObjectsDirty:    make(map[common.Address]struct{}, len(s.journal.dirties)),
+		stateObjectsDestruct: maps.Clone(s.stateObjectsDestruct),
+		refund:               s.refund,
+		logs:                 make(map[common.Hash][]*types.Log, len(s.logs)),
+		logSize:              s.logSize,
+		preimages:            maps.Clone(s.preimages),
+		journal:              newJournal(),
+		hasher:               crypto.NewKeccakState(),
+
+		// In order for the block producer to be able to use and make additions
+		// to the snapshot tree, we need to copy that as well. Otherwise, any
+		// block mined by ourselves will cause gaps in the tree, and force the
+		// miner to operate trie-backed only.
+		snaps: s.snaps,
+		snap:  s.snap,
+	}
+	for addr := range s.stateObjectsDirty {
+		if _, exist := state.stateObjects[addr]; !exist {
+			state.stateObjects[addr] = s.stateObjects[addr].simpleCopy(state)
+		}
+	}
+	state.stateObjectsDirty = maps.Clone(s.stateObjectsDirty)
+	// Copy the dirty states, logs, and preimages
+	for addr := range needCopy {
+		obj := s.stateObjects[addr]
+		if obj != nil {
+			state.stateObjects[addr] = obj.simpleCopy(state)
+		}
+	}
+
+	// Deep copy the logs occurred in the scope of block
+	for hash, logs := range s.logs {
+		cpy := make([]*types.Log, len(logs))
+		for i, l := range logs {
+			cpy[i] = new(types.Log)
+			*cpy[i] = *l
+		}
+		state.logs[hash] = cpy
+	}
+	return state
 }
 
 // Copy creates a deep, independent copy of the state.
