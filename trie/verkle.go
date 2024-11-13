@@ -21,14 +21,15 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/gballet/go-verkle"
+	"github.com/holiman/uint256"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/trie/utils"
 	"github.com/ethereum/go-ethereum/triedb/database"
-	"github.com/gballet/go-verkle"
-	"github.com/holiman/uint256"
 )
 
 var (
@@ -214,6 +215,11 @@ func (t *VerkleTrie) DeleteStorage(addr common.Address, key []byte) error {
 // can be used even if the tree doesn't have one.
 func (t *VerkleTrie) Hash() common.Hash {
 	return t.root.Commit().Bytes()
+}
+
+// Commit writes all nodes to the tree's memory database.
+func (t *VerkleTrie) PendingCommit(_ bool) (common.Hash, *trienode.NodeSet, error) {
+	return common.Hash{}, nil, fmt.Errorf("PendingCommit not supported")
 }
 
 // Commit writes all nodes to the tree's memory database.

@@ -25,6 +25,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/holiman/uint256"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/state/snapshot"
@@ -36,7 +38,6 @@ import (
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/ethereum/go-ethereum/trie/trienode"
 	"github.com/ethereum/go-ethereum/trie/triestate"
-	"github.com/holiman/uint256"
 )
 
 type revision struct {
@@ -81,6 +82,10 @@ type StateDB struct {
 	stateObjectsPending  map[common.Address]struct{}            // State objects finalized but not yet written to the trie
 	stateObjectsDirty    map[common.Address]struct{}            // State objects modified in the current execution
 	stateObjectsDestruct map[common.Address]*types.StateAccount // State objects destructed in the block along with its previous value
+	// stateObjectsPendingCommit in order to avoid duplicated stateObjectsDirty recommit
+	stateObjectsPendingCommit map[common.Address]struct{}
+	// stateObjectCounterInCommit records the counter for each address in whole one block txns
+	stateObjectCounterInCommit map[common.Address]int
 
 	// DB error.
 	// State objects are used by the consensus core and VM which are
@@ -145,24 +150,26 @@ func New(root common.Hash, db Database, snaps *snapshot.Tree) (*StateDB, error) 
 		return nil, err
 	}
 	sdb := &StateDB{
-		db:                   db,
-		trie:                 tr,
-		originalRoot:         root,
-		snaps:                snaps,
-		accounts:             make(map[common.Hash][]byte),
-		storages:             make(map[common.Hash]map[common.Hash][]byte),
-		accountsOrigin:       make(map[common.Address][]byte),
-		storagesOrigin:       make(map[common.Address]map[common.Hash][]byte),
-		stateObjects:         make(map[common.Address]*stateObject),
-		stateObjectsPending:  make(map[common.Address]struct{}),
-		stateObjectsDirty:    make(map[common.Address]struct{}),
-		stateObjectsDestruct: make(map[common.Address]*types.StateAccount),
-		logs:                 make(map[common.Hash][]*types.Log),
-		preimages:            make(map[common.Hash][]byte),
-		journal:              newJournal(),
-		accessList:           newAccessList(),
-		transientStorage:     newTransientStorage(),
-		hasher:               crypto.NewKeccakState(),
+		db:                         db,
+		trie:                       tr,
+		originalRoot:               root,
+		snaps:                      snaps,
+		accounts:                   make(map[common.Hash][]byte),
+		storages:                   make(map[common.Hash]map[common.Hash][]byte),
+		accountsOrigin:             make(map[common.Address][]byte),
+		storagesOrigin:             make(map[common.Address]map[common.Hash][]byte),
+		stateObjects:               make(map[common.Address]*stateObject),
+		stateObjectsPending:        make(map[common.Address]struct{}),
+		stateObjectsDirty:          make(map[common.Address]struct{}),
+		stateObjectsDestruct:       make(map[common.Address]*types.StateAccount),
+		stateObjectsPendingCommit:  make(map[common.Address]struct{}),
+		stateObjectCounterInCommit: make(map[common.Address]int),
+		logs:                       make(map[common.Hash][]*types.Log),
+		preimages:                  make(map[common.Hash][]byte),
+		journal:                    newJournal(),
+		accessList:                 newAccessList(),
+		transientStorage:           newTransientStorage(),
+		hasher:                     crypto.NewKeccakState(),
 	}
 	if sdb.snaps != nil {
 		sdb.snap = sdb.snaps.Snapshot(root)
@@ -693,23 +700,25 @@ func (s *StateDB) CreateAccount(addr common.Address) {
 func (s *StateDB) Copy() *StateDB {
 	// Copy all the basic fields, initialize the memory ones
 	state := &StateDB{
-		db:                   s.db,
-		trie:                 s.db.CopyTrie(s.trie),
-		originalRoot:         s.originalRoot,
-		accounts:             copySet(s.accounts),
-		storages:             copy2DSet(s.storages),
-		accountsOrigin:       copySet(s.accountsOrigin),
-		storagesOrigin:       copy2DSet(s.storagesOrigin),
-		stateObjects:         make(map[common.Address]*stateObject, len(s.journal.dirties)),
-		stateObjectsPending:  make(map[common.Address]struct{}, len(s.stateObjectsPending)),
-		stateObjectsDirty:    make(map[common.Address]struct{}, len(s.journal.dirties)),
-		stateObjectsDestruct: maps.Clone(s.stateObjectsDestruct),
-		refund:               s.refund,
-		logs:                 make(map[common.Hash][]*types.Log, len(s.logs)),
-		logSize:              s.logSize,
-		preimages:            maps.Clone(s.preimages),
-		journal:              newJournal(),
-		hasher:               crypto.NewKeccakState(),
+		db:                         s.db,
+		trie:                       s.db.CopyTrie(s.trie),
+		originalRoot:               s.originalRoot,
+		accounts:                   copySet(s.accounts),
+		storages:                   copy2DSet(s.storages),
+		accountsOrigin:             copySet(s.accountsOrigin),
+		storagesOrigin:             copy2DSet(s.storagesOrigin),
+		stateObjects:               make(map[common.Address]*stateObject, len(s.journal.dirties)),
+		stateObjectsPending:        make(map[common.Address]struct{}, len(s.stateObjectsPending)),
+		stateObjectsDirty:          make(map[common.Address]struct{}, len(s.journal.dirties)),
+		stateObjectsDestruct:       maps.Clone(s.stateObjectsDestruct),
+		stateObjectsPendingCommit:  maps.Clone(s.stateObjectsPendingCommit),
+		stateObjectCounterInCommit: maps.Clone(s.stateObjectCounterInCommit),
+		refund:                     s.refund,
+		logs:                       make(map[common.Hash][]*types.Log, len(s.logs)),
+		logSize:                    s.logSize,
+		preimages:                  maps.Clone(s.preimages),
+		journal:                    newJournal(),
+		hasher:                     crypto.NewKeccakState(),
 
 		// In order for the block producer to be able to use and make additions
 		// to the snapshot tree, we need to copy that as well. Otherwise, any
@@ -850,6 +859,7 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 		obj.created = false
 		s.stateObjectsPending[addr] = struct{}{}
 		s.stateObjectsDirty[addr] = struct{}{}
+		delete(s.stateObjectsPendingCommit, addr)
 
 		// At this point, also ship the address off to the precacher. The precacher
 		// will start loading tries, and when the change is eventually committed,
@@ -861,6 +871,33 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 	}
 	// Invalidate journal because reverting across transactions is not allowed.
 	s.clearJournalAndRefund()
+}
+
+func (s *StateDB) PendingIntermediateRoot(deleteEmptyObjects bool) {
+	s.Finalise(deleteEmptyObjects)
+	for addr := range s.stateObjectsPending {
+		if obj := s.stateObjects[addr]; !obj.deleted {
+			obj.updateRoot()
+		}
+	}
+	usedAddrs := make([][]byte, 0, len(s.stateObjectsPending))
+	var deletedAddrs []common.Address
+	for addr := range s.stateObjectsPending {
+		if obj := s.stateObjects[addr]; !obj.deleted {
+			s.updateStateObject(obj)
+			s.AccountUpdated += 1
+		} else {
+			deletedAddrs = append(deletedAddrs, obj.address)
+		}
+		usedAddrs = append(usedAddrs, common.CopyBytes(addr[:])) // Copy needed for closure
+	}
+	for _, deletedAddr := range deletedAddrs {
+		s.deleteStateObject(deletedAddr)
+		s.AccountDeleted += 1
+	}
+	if len(s.stateObjectsPending) > 0 {
+		s.stateObjectsPending = make(map[common.Address]struct{})
+	}
 }
 
 // IntermediateRoot computes the current root hash of the state trie.
@@ -1146,6 +1183,60 @@ func (s *StateDB) GetTrie() Trie {
 	return s.trie
 }
 
+func (s *StateDB) PendingCommit(deleteEmptyObjects bool) error {
+	if s.dbErr != nil {
+		return fmt.Errorf("pending commit aborted due to earlier error: %v", s.dbErr)
+	}
+	s.PendingIntermediateRoot(deleteEmptyObjects)
+	var (
+		storageTrieNodesUpdated int
+		storageTrieNodesDeleted int
+		nodes                   = trienode.NewMergedNodeSet()
+		//codeWriter              = s.db.DiskDB().NewBatch()
+	)
+	// Handle all state deletions first
+	if err := s.handleDestruction(nodes); err != nil {
+		return err
+	}
+	// Handle all state updates afterwards
+	for addr := range s.stateObjectsDirty {
+		obj := s.stateObjects[addr]
+		if obj.deleted {
+			continue
+		}
+		if _, ok := s.stateObjectsPendingCommit[addr]; ok {
+			continue
+		}
+		if s.AddrPendingCommitHasCounter(obj.Address()) {
+			continue
+		}
+		set, err := obj.pendingCommit()
+		if err != nil {
+			return err
+		}
+		// Merge the dirty nodes of storage trie into global set. It is possible
+		// that the account was destructed and then resurrected in the same block.
+		// In this case, the node set is shared by both accounts.
+		if set != nil {
+			if err := nodes.Merge(set); err != nil {
+				return err
+			}
+			updates, deleted := set.Size()
+			storageTrieNodesUpdated += updates
+			storageTrieNodesDeleted += deleted
+		}
+		s.stateObjectsPendingCommit[addr] = struct{}{}
+	}
+	origin := s.originalRoot
+	if origin == (common.Hash{}) {
+		origin = types.EmptyRootHash
+	}
+	if err := s.db.TrieDB().PendingUpdate(origin, nodes); err != nil {
+		return err
+	}
+	return nil
+}
+
 // Commit writes the state to the underlying in-memory trie database.
 // Once the state is committed, tries cached in stateDB (including account
 // trie, storage tries) will no longer be functional. A new state instance
@@ -1282,6 +1373,7 @@ func (s *StateDB) Commit(block uint64, deleteEmptyObjects bool) (common.Hash, er
 	s.storagesOrigin = make(map[common.Address]map[common.Hash][]byte)
 	s.stateObjectsDirty = make(map[common.Address]struct{})
 	s.stateObjectsDestruct = make(map[common.Address]*types.StateAccount)
+	s.stateObjectsPendingCommit = make(map[common.Address]struct{})
 	return root, nil
 }
 
@@ -1373,6 +1465,39 @@ func (s *StateDB) convertAccountSet(set map[common.Address]*types.StateAccount) 
 		}
 	}
 	return ret
+}
+
+func (s *StateDB) AddrInPendingCommitInc(addr common.Address) {
+	v, ok := s.stateObjectCounterInCommit[addr]
+	if ok {
+		s.stateObjectCounterInCommit[addr] = v + 1
+		return
+	}
+	s.stateObjectCounterInCommit[addr] = 1
+}
+
+func (s *StateDB) AddrInPendingCommitSub(addr common.Address) {
+	v, ok := s.stateObjectCounterInCommit[addr]
+	if ok {
+		if v == 1 {
+			delete(s.stateObjectCounterInCommit, addr)
+			return
+		}
+		s.stateObjectCounterInCommit[addr] = v - 1
+		return
+	}
+}
+
+func (s *StateDB) ClearAddrInPendingCommit() {
+	s.stateObjectCounterInCommit = make(map[common.Address]int)
+}
+
+func (s *StateDB) AddrPendingCommitHasCounter(addr common.Address) bool {
+	v, ok := s.stateObjectCounterInCommit[addr]
+	if ok {
+		return true
+	}
+	return v >= 3
 }
 
 // copySet returns a deep-copied set.

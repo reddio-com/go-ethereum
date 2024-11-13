@@ -70,6 +70,7 @@ type backend interface {
 	// everything. Therefore, these maps must not be changed afterwards.
 	Update(root common.Hash, parent common.Hash, block uint64, nodes *trienode.MergedNodeSet, states *triestate.Set) error
 
+	PendingUpdate(parent common.Hash, nodes *trienode.MergedNodeSet) error
 	// Commit writes all relevant trie nodes belonging to the specified state
 	// to disk. Report specifies whether logs will be displayed in info level.
 	Commit(root common.Hash, report bool) error
@@ -146,6 +147,10 @@ func (db *Database) Update(root common.Hash, parent common.Hash, block uint64, n
 		db.preimages.commit(false)
 	}
 	return db.backend.Update(root, parent, block, nodes, states)
+}
+
+func (db *Database) PendingUpdate(parent common.Hash, nodes *trienode.MergedNodeSet) error {
+	return db.backend.PendingUpdate(parent, nodes)
 }
 
 // Commit iterates over all the children of a particular node, writes them out

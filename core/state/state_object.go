@@ -23,13 +23,14 @@ import (
 	"maps"
 	"time"
 
+	"github.com/holiman/uint256"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie/trienode"
-	"github.com/holiman/uint256"
 )
 
 type Code []byte
@@ -403,6 +404,29 @@ func (s *stateObject) commit() (*trienode.NodeSet, error) {
 	// cached mutations. Call commit to acquire a set of nodes that have been
 	// modified, the set can be nil if nothing to commit.
 	root, nodes, err := s.trie.Commit(false)
+	if err != nil {
+		return nil, err
+	}
+	s.data.Root = root
+
+	// Update original account data after commit
+	s.origin = s.data.Copy()
+	return nodes, nil
+}
+
+func (s *stateObject) pendingCommit() (*trienode.NodeSet, error) {
+	// Short circuit if trie is not even loaded, don't bother with committing anything
+	if s.trie == nil {
+		s.origin = s.data.Copy()
+		return nil, nil
+	}
+	// Track the amount of time wasted on committing the storage trie
+	defer func(start time.Time) { s.db.StorageCommits += time.Since(start) }(time.Now())
+
+	// The trie is currently in an open state and could potentially contain
+	// cached mutations. Call commit to acquire a set of nodes that have been
+	// modified, the set can be nil if nothing to commit.
+	root, nodes, err := s.trie.PendingCommit(false)
 	if err != nil {
 		return nil, err
 	}

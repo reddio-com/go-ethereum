@@ -235,6 +235,11 @@ func (t *StateTrie) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet, er
 	return t.trie.Commit(collectLeaf)
 }
 
+func (t *StateTrie) PendingCommit(collectLeaf bool) (common.Hash, *trienode.NodeSet, error) {
+	// Commit the trie and return its modified nodeset.
+	return t.trie.PendingCommit(collectLeaf)
+}
+
 // Hash returns the root hash of StateTrie. It does not write to the
 // database and can be used even if the trie doesn't have one.
 func (t *StateTrie) Hash() common.Hash {
