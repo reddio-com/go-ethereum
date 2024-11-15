@@ -21,12 +21,13 @@ import (
 	"fmt"
 	"sync"
 
+	"golang.org/x/crypto/sha3"
+
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/rlp"
 	"github.com/ethereum/go-ethereum/trie/trienode"
-	"golang.org/x/crypto/sha3"
 )
 
 // Trie is an Ethereum state trie, can be implemented by Ethereum Merkle Patricia
@@ -44,6 +45,8 @@ type Trie interface {
 	// Commit the trie and returns a set of dirty nodes generated along with
 	// the new root hash.
 	Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet, error)
+
+	PendingCommit(collectLeaf bool) (common.Hash, *trienode.NodeSet, error)
 }
 
 // TrieLoader wraps functions to load tries.

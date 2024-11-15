@@ -267,6 +267,102 @@ func (s *stateObject) finalise(prefetch bool) {
 	}
 }
 
+func (s *stateObject) forceUpdateTire() (Trie, error) {
+	// Make sure all dirty slots are finalized into the pending storage area
+	s.finalise(false)
+
+	// Track the amount of time wasted on updating the storage trie
+	defer func(start time.Time) { s.db.StorageUpdates += time.Since(start) }(time.Now())
+
+	// The snapshot storage map for the object
+	var (
+		storage map[common.Hash][]byte
+		origin  map[common.Hash][]byte
+	)
+	tr, err := s.getTrie()
+	if err != nil {
+		s.db.setError(err)
+		return nil, err
+	}
+	// Insert all the pending storage updates into the trie
+	usedStorage := make([][]byte, 0, len(s.pendingStorage))
+
+	// Perform trie updates before deletions.  This prevents resolution of unnecessary trie nodes
+	//  in circumstances similar to the following:
+	//
+	// Consider nodes `A` and `B` who share the same full node parent `P` and have no other siblings.
+	// During the execution of a block:
+	// - `A` is deleted,
+	// - `C` is created, and also shares the parent `P`.
+	// If the deletion is handled first, then `P` would be left with only one child, thus collapsed
+	// into a shortnode. This requires `B` to be resolved from disk.
+	// Whereas if the created node is handled first, then the collapse is avoided, and `B` is not resolved.
+	var deletions []common.Hash
+	for key, value := range s.pendingStorage {
+		// Skip noop changes, persist actual changes
+		if value == s.originStorage[key] {
+			continue
+		}
+		prev := s.originStorage[key]
+		s.originStorage[key] = value
+
+		var encoded []byte // rlp-encoded value to be used by the snapshot
+		if (value != common.Hash{}) {
+			// Encoding []byte cannot fail, ok to ignore the error.
+			trimmed := common.TrimLeftZeroes(value[:])
+			encoded, _ = rlp.EncodeToBytes(trimmed)
+			if err := tr.UpdateStorage(s.address, key[:], trimmed); err != nil {
+				s.db.setError(err)
+				return nil, err
+			}
+			s.db.StorageUpdated += 1
+		} else {
+			deletions = append(deletions, key)
+		}
+		// Cache the mutated storage slots until commit
+		if storage == nil {
+			if storage = s.db.storages[s.addrHash]; storage == nil {
+				storage = make(map[common.Hash][]byte)
+				s.db.storages[s.addrHash] = storage
+			}
+		}
+		khash := crypto.HashData(s.db.hasher, key[:])
+		storage[khash] = encoded // encoded will be nil if it's deleted
+
+		// Cache the original value of mutated storage slots
+		if origin == nil {
+			if origin = s.db.storagesOrigin[s.address]; origin == nil {
+				origin = make(map[common.Hash][]byte)
+				s.db.storagesOrigin[s.address] = origin
+			}
+		}
+		// Track the original value of slot only if it's mutated first time
+		if _, ok := origin[khash]; !ok {
+			if prev == (common.Hash{}) {
+				origin[khash] = nil // nil if it was not present previously
+			} else {
+				// Encoding []byte cannot fail, ok to ignore the error.
+				b, _ := rlp.EncodeToBytes(common.TrimLeftZeroes(prev[:]))
+				origin[khash] = b
+			}
+		}
+		// Cache the items for preloading
+		usedStorage = append(usedStorage, common.CopyBytes(key[:])) // Copy needed for closure
+	}
+	for _, key := range deletions {
+		if err := tr.DeleteStorage(s.address, key[:]); err != nil {
+			s.db.setError(err)
+			return nil, err
+		}
+		s.db.StorageDeleted += 1
+	}
+	if s.db.prefetcher != nil {
+		s.db.prefetcher.used(s.addrHash, s.data.Root, usedStorage)
+	}
+	s.pendingStorage = make(Storage) // reset pending map
+	return tr, nil
+}
+
 // updateTrie is responsible for persisting cached storage changes into the
 // object's storage trie. In case the storage trie is not yet loaded, this
 // function will load the trie automatically. If any issues arise during the
@@ -386,6 +482,33 @@ func (s *stateObject) updateRoot() {
 	defer func(start time.Time) { s.db.StorageHashes += time.Since(start) }(time.Now())
 
 	s.data.Root = tr.Hash()
+}
+
+func (s *stateObject) forceUpdateRoot() {
+	// Flush cached storage mutations into trie, short circuit if any error
+	// is occurred or there is no change in the trie.
+	tr, err := s.forceUpdateTire()
+	if err != nil || tr == nil {
+		return
+	}
+	// Track the amount of time wasted on hashing the storage trie
+	defer func(start time.Time) { s.db.StorageHashes += time.Since(start) }(time.Now())
+
+	s.data.Root = tr.Hash()
+}
+
+func (s *stateObject) pendingCommit() (*trienode.NodeSet, error) {
+	// Short circuit if trie is not even loaded, don't bother with committing anything
+	if s.trie == nil {
+		s.origin = s.data.Copy()
+		return nil, nil
+	}
+	// The trie is currently in an open state and could potentially contain
+	// cached mutations. Call commit to acquire a set of nodes that have been
+	// modified, the set can be nil if nothing to commit.
+	root := s.trie.Hash()
+	s.data.Root = root
+	return nil, nil
 }
 
 // commit obtains a set of dirty storage trie nodes and updates the account data.

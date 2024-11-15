@@ -78,10 +78,11 @@ type StateDB struct {
 
 	// This map holds 'live' objects, which will get modified while processing
 	// a state transition.
-	stateObjects         map[common.Address]*stateObject
-	stateObjectsPending  map[common.Address]struct{}            // State objects finalized but not yet written to the trie
-	stateObjectsDirty    map[common.Address]struct{}            // State objects modified in the current execution
-	stateObjectsDestruct map[common.Address]*types.StateAccount // State objects destructed in the block along with its previous value
+	stateObjects             map[common.Address]*stateObject
+	stateObjectsPending      map[common.Address]struct{}            // State objects finalized but not yet written to the trie
+	stateObjectsDirty        map[common.Address]struct{}            // State objects modified in the current execution
+	stateObjectsDestruct     map[common.Address]*types.StateAccount // State objects destructed in the block along with its previous value
+	stateObjectPendingCommit map[common.Address]struct{}
 
 	// DB error.
 	// State objects are used by the consensus core and VM which are
@@ -146,24 +147,25 @@ func New(root common.Hash, db Database, snaps *snapshot.Tree) (*StateDB, error) 
 		return nil, err
 	}
 	sdb := &StateDB{
-		db:                   db,
-		trie:                 tr,
-		originalRoot:         root,
-		snaps:                snaps,
-		accounts:             make(map[common.Hash][]byte),
-		storages:             make(map[common.Hash]map[common.Hash][]byte),
-		accountsOrigin:       make(map[common.Address][]byte),
-		storagesOrigin:       make(map[common.Address]map[common.Hash][]byte),
-		stateObjects:         make(map[common.Address]*stateObject),
-		stateObjectsPending:  make(map[common.Address]struct{}),
-		stateObjectsDirty:    make(map[common.Address]struct{}),
-		stateObjectsDestruct: make(map[common.Address]*types.StateAccount),
-		logs:                 make(map[common.Hash][]*types.Log),
-		preimages:            make(map[common.Hash][]byte),
-		journal:              newJournal(),
-		accessList:           newAccessList(),
-		transientStorage:     newTransientStorage(),
-		hasher:               crypto.NewKeccakState(),
+		db:                       db,
+		trie:                     tr,
+		originalRoot:             root,
+		snaps:                    snaps,
+		accounts:                 make(map[common.Hash][]byte),
+		storages:                 make(map[common.Hash]map[common.Hash][]byte),
+		accountsOrigin:           make(map[common.Address][]byte),
+		storagesOrigin:           make(map[common.Address]map[common.Hash][]byte),
+		stateObjects:             make(map[common.Address]*stateObject),
+		stateObjectsPending:      make(map[common.Address]struct{}),
+		stateObjectsDirty:        make(map[common.Address]struct{}),
+		stateObjectsDestruct:     make(map[common.Address]*types.StateAccount),
+		stateObjectPendingCommit: make(map[common.Address]struct{}),
+		logs:                     make(map[common.Hash][]*types.Log),
+		preimages:                make(map[common.Hash][]byte),
+		journal:                  newJournal(),
+		accessList:               newAccessList(),
+		transientStorage:         newTransientStorage(),
+		hasher:                   crypto.NewKeccakState(),
 	}
 	if sdb.snaps != nil {
 		sdb.snap = sdb.snaps.Snapshot(root)
@@ -905,6 +907,7 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 		obj.created = false
 		s.stateObjectsPending[addr] = struct{}{}
 		s.stateObjectsDirty[addr] = struct{}{}
+		delete(s.stateObjectPendingCommit, addr)
 
 		// At this point, also ship the address off to the precacher. The precacher
 		// will start loading tries, and when the change is eventually committed,
@@ -916,6 +919,82 @@ func (s *StateDB) Finalise(deleteEmptyObjects bool) {
 	}
 	// Invalidate journal because reverting across transactions is not allowed.
 	s.clearJournalAndRefund()
+}
+
+// IntermediateRoot computes the current root hash of the state trie.
+// It is called in between transactions to get the root hash that
+// goes into transaction receipts.
+func (s *StateDB) PendingIntermediateRoot(deleteEmptyObjects bool) {
+	// Finalise all the dirty storage states and write them into the tries
+	s.Finalise(deleteEmptyObjects)
+
+	// If there was a trie prefetcher operating, it gets aborted and irrevocably
+	// modified after we start retrieving tries. Remove it from the statedb after
+	// this round of use.
+	//
+	// This is weird pre-byzantium since the first tx runs with a prefetcher and
+	// the remainder without, but pre-byzantium even the initial prefetcher is
+	// useless, so no sleep lost.
+	prefetcher := s.prefetcher
+	if s.prefetcher != nil {
+		defer func() {
+			s.prefetcher.close()
+			s.prefetcher = nil
+		}()
+	}
+	// Although naively it makes sense to retrieve the account trie and then do
+	// the contract storage and account updates sequentially, that short circuits
+	// the account prefetcher. Instead, let's process all the storage updates
+	// first, giving the account prefetches just a few more milliseconds of time
+	// to pull useful data from disk.
+	for addr := range s.stateObjectsPending {
+		if obj := s.stateObjects[addr]; !obj.deleted {
+			obj.forceUpdateRoot()
+		}
+	}
+	// Now we're about to start to write changes to the trie. The trie is so far
+	// _untouched_. We can check with the prefetcher, if it can give us a trie
+	// which has the same root, but also has some content loaded into it.
+	if prefetcher != nil {
+		if trie := prefetcher.trie(common.Hash{}, s.originalRoot); trie != nil {
+			s.trie = trie
+		}
+	}
+	usedAddrs := make([][]byte, 0, len(s.stateObjectsPending))
+	// Perform updates before deletions.  This prevents resolution of unnecessary trie nodes
+	// in circumstances similar to the following:
+	//
+	// Consider nodes `A` and `B` who share the same full node parent `P` and have no other siblings.
+	// During the execution of a block:
+	// - `A` self-destructs,
+	// - `C` is created, and also shares the parent `P`.
+	// If the self-destruct is handled first, then `P` would be left with only one child, thus collapsed
+	// into a shortnode. This requires `B` to be resolved from disk.
+	// Whereas if the created node is handled first, then the collapse is avoided, and `B` is not resolved.
+	var deletedAddrs []common.Address
+	for addr := range s.stateObjectsPending {
+		if obj := s.stateObjects[addr]; !obj.deleted {
+			s.updateStateObject(obj)
+			s.AccountUpdated += 1
+		} else {
+			deletedAddrs = append(deletedAddrs, obj.address)
+		}
+		usedAddrs = append(usedAddrs, common.CopyBytes(addr[:])) // Copy needed for closure
+	}
+	for _, deletedAddr := range deletedAddrs {
+		s.deleteStateObject(deletedAddr)
+		s.AccountDeleted += 1
+	}
+	if prefetcher != nil {
+		prefetcher.used(common.Hash{}, s.originalRoot, usedAddrs)
+	}
+	if len(s.stateObjectsPending) > 0 {
+		s.stateObjectsPending = make(map[common.Address]struct{})
+	}
+	// Track the amount of time wasted on hashing the account trie
+	defer func(start time.Time) { s.AccountHashes += time.Since(start) }(time.Now())
+
+	return
 }
 
 // IntermediateRoot computes the current root hash of the state trie.
@@ -1199,6 +1278,53 @@ func (s *StateDB) handleDestruction(nodes *trienode.MergedNodeSet) error {
 // GetTrie returns the account trie.
 func (s *StateDB) GetTrie() Trie {
 	return s.trie
+}
+
+func (s *StateDB) ClearPendingCommitMark() {
+	s.stateObjectPendingCommit = make(map[common.Address]struct{})
+}
+
+func (s *StateDB) PendingCommit(deleteEmptyObjects bool, avoidObj map[common.Address]int) error {
+	if s.dbErr != nil {
+		return fmt.Errorf("commit aborted due to earlier error: %v", s.dbErr)
+	}
+	// Finalize any pending changes and merge everything into the tries
+	s.PendingIntermediateRoot(deleteEmptyObjects)
+	// Handle all state deletions first
+	var (
+		nodes = trienode.NewMergedNodeSet()
+	)
+	if err := s.handleDestruction(nodes); err != nil {
+		return err
+	}
+	// Handle all state updates afterwards
+	for addr := range s.stateObjectsDirty {
+		obj := s.stateObjects[addr]
+		if obj.deleted {
+			continue
+		}
+		if _, ok := s.stateObjectPendingCommit[addr]; ok {
+			continue
+		}
+		if v, ok := avoidObj[addr]; ok && v > 0 {
+			continue
+		}
+		// Write any storage changes in the state object to its storage trie
+		set, err := obj.pendingCommit()
+		if err != nil {
+			return err
+		}
+		// Merge the dirty nodes of storage trie into global set. It is possible
+		// that the account was destructed and then resurrected in the same block.
+		// In this case, the node set is shared by both accounts.
+		if set != nil {
+			if err := nodes.Merge(set); err != nil {
+				return err
+			}
+		}
+		s.stateObjectPendingCommit[addr] = struct{}{}
+	}
+	return nil
 }
 
 // Commit writes the state to the underlying in-memory trie database.
