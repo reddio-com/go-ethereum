@@ -78,6 +78,10 @@ func (h *testHasher) Delete(key []byte) error {
 	return nil
 }
 
+func (h *testHasher) PendingCommit(collectLeaf bool) (common.Hash, *trienode.NodeSet, error) {
+	return [32]byte{}, nil, nil
+}
+
 // Commit computes the new hash of the states and returns the set with all
 // state changes.
 func (h *testHasher) Commit(collectLeaf bool) (common.Hash, *trienode.NodeSet, error) {

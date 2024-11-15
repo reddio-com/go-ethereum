@@ -602,6 +602,40 @@ func (t *Trie) Hash() common.Hash {
 	return common.BytesToHash(hash.(hashNode))
 }
 
+func (t *Trie) PendingCommit(collectLeaf bool) (common.Hash, *trienode.NodeSet, error) {
+	defer t.tracer.reset()
+	// Trie is empty and can be classified into two types of situations:
+	// (a) The trie was empty and no update happens => return nil
+	// (b) The trie was non-empty and all nodes are dropped => return
+	//     the node set includes all deleted nodes
+	if t.root == nil {
+		paths := t.tracer.deletedNodes()
+		if len(paths) == 0 {
+			return types.EmptyRootHash, nil, nil // case (a)
+		}
+		nodes := trienode.NewNodeSet(t.owner)
+		for _, path := range paths {
+			nodes.AddNode([]byte(path), trienode.NewDeleted())
+		}
+		return types.EmptyRootHash, nodes, nil // case (b)
+	}
+	// Derive the hash for all dirty nodes first. We hold the assumption
+	// in the following procedure that all nodes are hashed.
+	rootHash := t.Hash()
+	// Do a quick check if we really need to commit. This can happen e.g.
+	// if we load a trie for reading storage values, but don't write to it.
+	if hashedNode, dirty := t.root.cache(); !dirty {
+		t.root = hashedNode
+		return rootHash, nil, nil
+	}
+	nodes := trienode.NewNodeSet(t.owner)
+	for _, path := range t.tracer.deletedNodes() {
+		nodes.AddNode([]byte(path), trienode.NewDeleted())
+	}
+	newCommitter(nodes, t.tracer, collectLeaf).Commit(t.root)
+	return rootHash, nodes, nil
+}
+
 // Commit collects all dirty nodes in the trie and replaces them with the
 // corresponding node hash. All collected nodes (including dirty leaves if
 // collectLeaf is true) will be encapsulated into a nodeset for return.
